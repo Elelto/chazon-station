@@ -44,7 +44,20 @@ except Exception:
 # Shown in the header of every session and printed at startup, so "which
 # version is this stick running?" is always answerable by phone. Bump on every
 # change that ships to a station; UPDATE.bat pulls whatever is published.
-VERSION = "1.0 (2026-08-11)"
+VERSION = "1.1 (2026-08-11)"
+
+# Results channel: "שלח תוצאות" POSTs the station's whole journal to the
+# owner's Google Form (which needs no login), one paragraph answer per chunk;
+# the linked spreadsheet is where journals are collected at home. The form's
+# questions are a leftover "Vision Planner" template - harmless, but the entry
+# ids below are bound to those questions, so RENAMING questions is safe and
+# DELETING them breaks sending. Chunks stay well under Google's answer cap.
+SEND_FORM = ("https://docs.google.com/forms/d/e/"
+             "1FAIpQLSfSFEAI1Cs1_d4G4b0aXYGQQGRUHxABqrvk0NH7z3mANes7qw"
+             "/formResponse")
+SEND_FIELD_STATION = "entry.2020053099"     # "full name" -> station + part
+SEND_FIELD_DATA = "entry.155726175"         # paragraph   -> meta line + journal lines
+SEND_CHUNK = 60_000
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Overridable so a second copy can be run for testing without fighting the real
@@ -596,6 +609,59 @@ def record_decision(payload, reviewer):
     return {"ok": True, "id": bid, "action": action}
 
 
+def send_results():
+    """POST every journal line home through the owner's Google Form.
+
+    Always sends EVERYTHING, not a diff: apply_decisions.py dedups by
+    (ts, id/shelf_key, action), so a resend costs nothing and a partial earlier
+    send can never lose work. The journal also stays on the stick - this is a
+    copy home, not a move. Success is detected by the confirmation page having
+    no <form> element (the error path re-renders the form), which is
+    language-independent."""
+    import urllib.request
+    from urllib.parse import urlencode
+    lines = []
+    if os.path.isdir(DECISIONS_DIR):
+        for fn in sorted(os.listdir(DECISIONS_DIR)):
+            if fn.endswith(".jsonl"):
+                with open(os.path.join(DECISIONS_DIR, fn), encoding="utf-8") as f:
+                    lines += [l.rstrip("\n") for l in f if l.strip()]
+    if not lines:
+        return {"ok": False, "error": "אין עדיין החלטות לשלוח"}
+
+    chunks, cur, size = [], [], 0
+    for l in lines:
+        if size + len(l) > SEND_CHUNK and cur:
+            chunks.append(cur); cur, size = [], 0
+        cur.append(l); size += len(l) + 1
+    chunks.append(cur)
+
+    st = load_station()["name"] or "?"
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    for i, ch in enumerate(chunks, 1):
+        meta = json.dumps({"station": st, "sent": now, "part": i,
+                           "of": len(chunks), "lines": len(ch)},
+                          ensure_ascii=False)
+        data = urlencode({
+            SEND_FIELD_STATION: "%s - %d/%d" % (st, i, len(chunks)),
+            SEND_FIELD_DATA: meta + "\n" + "\n".join(ch),
+        }).encode("utf-8")
+        req = urllib.request.Request(SEND_FORM, data=data, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with urllib.request.urlopen(req, timeout=45) as r:
+                body = r.read(300_000).decode("utf-8", "replace")
+                if r.status != 200 or "<form" in body:
+                    return {"ok": False,
+                            "error": "השליחה נדחתה בחלק %d מתוך %d - נסה שוב"
+                                     % (i, len(chunks))}
+        except Exception:
+            return {"ok": False,
+                    "error": "אין חיבור לאינטרנט - נסה שוב כשיש רשת"}
+    return {"ok": True, "sent": len(lines), "parts": len(chunks)}
+
+
 # ---------------------------------------------------------------- http
 
 class Handler(BaseHTTPRequestHandler):
@@ -705,6 +771,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "login required"}); return
         if path == "/api/decide":
             self._send(200, record_decision(payload, who))
+        elif path == "/api/send":
+            self._send(200, send_results())
         else:
             self._send(404, {"error": "not found"})
 
@@ -851,6 +919,8 @@ border:1px solid var(--line);border-radius:9px;background:#fff;color:var(--ink)}
   <span class="mut" id="who"></span>
   <button id="tabb" class="tab on" onclick="setMode('books')">ספרים</button>
   <button id="tabs" class="tab" onclick="setMode('shelves')">ספירת ספרים</button>
+  <button id="sendb" class="tab" onclick="sendHome()"
+    style="border-color:#1d9e75;color:#0f6e56">שלח תוצאות</button>
   <div class="prog"><i id="pb" style="width:0"></i></div>
   <span class="mut" id="cnt"></span>
 </div>
@@ -906,6 +976,24 @@ async function boot(){
   const d=await (await fetch('/api/books?filter=todo')).json();
   D=d.rows; render();
 }
+let SENDING=false;
+async function sendHome(){
+  if(SENDING)return;
+  if(!confirm('לשלוח הביתה את כל ההחלטות שנעשו בתחנה הזאת?\n'+
+              'אפשר לשלוח כמה פעמים - כפילויות מסוננות בבית.'))return;
+  SENDING=true;
+  const b=$('#sendb'), t0=b?b.textContent:'';
+  if(b){b.disabled=true;b.textContent='שולח...'}
+  try{
+    const r=await fetch('/api/send',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    alert(j.ok?('נשלחו הביתה '+j.sent+' החלטות. תודה רבה!')
+              :(j.error||'שגיאה בשליחה'));
+  }catch(e){alert('שגיאה בשליחה - נסה שוב');}
+  if(b){b.disabled=false;b.textContent=t0}
+  SENDING=false;
+}
 async function setMode(m){
   MODE=m;
   $('#tabb').className='tab'+(m==='books'?' on':'');
@@ -931,7 +1019,9 @@ function renderBook(){
   stat(); SEL=null; CLICK=null; MAP=null; WIDE=false; SIBS=[];
   if(i>=D.length){$('#app').innerHTML='<div id="done">סיימת את כל הספרים. תודה רבה!'+
     '<br><br><button style="height:46px" onclick="setMode(\'shelves\')">'+
-    'המשך לספירת הספרים</button></div>';return}
+    'המשך לספירת הספרים</button> '+
+    '<button style="height:46px;border-color:#1d9e75;color:#0f6e56" '+
+    'onclick="sendHome()">שלח את התוצאות הביתה</button></div>';return}
   const c=D[i];
   const hasStrip=!!(c.photo&&c.bbox);
   let mid;
@@ -1241,7 +1331,9 @@ function statS(){
 function renderShelf(){
   statS(); SHMAP=null;
   if(!T||ti>=T.length){
-    $('#app').innerHTML='<div id="done">נספרו כל התמונות בתחנה הזאת. תודה רבה!</div>';
+    $('#app').innerHTML='<div id="done">נספרו כל התמונות בתחנה הזאת. תודה רבה!'+
+      '<br><br><button style="height:46px;border-color:#1d9e75;color:#0f6e56" '+
+      'onclick="sendHome()">שלח את התוצאות הביתה</button></div>';
     return}
   const t=T[ti];
   const sh=t.shelves.length?' · מדף '+t.shelves.map(esc).join(', '):'';
